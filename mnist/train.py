@@ -1,12 +1,15 @@
 import argparse
 import os
 import time
+import random
 
 from utee import misc
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.autograd import Variable
+
+from torch.utils.tensorboard import SummaryWriter
 
 import dataset
 import model
@@ -28,6 +31,10 @@ args = parser.parse_args()
 args.logdir = os.path.join(os.path.dirname(__file__), args.logdir)
 misc.logger.init(args.logdir, 'train_log')
 print = misc.logger.info
+
+# seed
+torch.manual_seed(0)
+random.seed(0)
 
 # select gpu
 args.gpu = misc.auto_select_gpu(utility_bound=0, num_gpu=args.ngpu, selected_gpus=args.gpu)
@@ -54,13 +61,17 @@ model = model.mnist(input_dims=784, n_hiddens=[256, 256], n_class=10)
 model = torch.nn.DataParallel(model, device_ids= range(args.ngpu))
 if args.cuda:
     model.cuda()
-
+    
+writer = SummaryWriter('runs/exp_factor1p0')
+FACTOR = 1
+EXP_FILE = 'experiments.txt'
 # optimizer
 optimizer = optim.SGD(model.parameters(), lr=args.lr, weight_decay=args.wd, momentum=0.9)
 decreasing_lr = list(map(int, args.decreasing_lr.split(',')))
 print('decreasing_lr: ' + str(decreasing_lr))
 best_acc, old_file = 0, None
 t_begin = time.time()
+log_texts = []
 try:
     # ready to go
     for epoch in range(args.epochs):
@@ -77,22 +88,34 @@ try:
             output = model(data)
             loss = F.cross_entropy(output, target)
             loss.backward()
+            
+            # Increase impact of negative gradient
+            for p in model.parameters():
+                p.grad[p.grad < 0] *= FACTOR # doubly shy
             optimizer.step()
 
             if batch_idx % args.log_interval == 0 and batch_idx > 0:
                 pred = output.data.max(1)[1]  # get the index of the max log-probability
                 correct = pred.cpu().eq(indx_target).sum()
                 acc = correct * 1.0 / len(data)
-                print('Train Epoch: {} [{}/{}] Loss: {:.6f} Acc: {:.4f} lr: {:.2e}'.format(
+                log_text = 'Train Epoch: {} [{}/{}] Loss: {:.6f} Acc: {:.4f} lr: {:.2e}'.format(
                     epoch, batch_idx * len(data), len(train_loader.dataset),
-                    loss.data, acc, optimizer.param_groups[0]['lr']))
+                    loss.data, acc, optimizer.param_groups[0]['lr'])
+                print(log_text)
+                log_texts.append(log_text)
+                writer.add_scalar('training loss',
+                            loss.data, (batch_idx * len(data)/len(train_loader.dataset)) + epoch)
+                writer.add_scalar('training accuracy',
+                            acc, (batch_idx * len(data)/len(train_loader.dataset)) + epoch)
 
         elapse_time = time.time() - t_begin
         speed_epoch = elapse_time / (epoch + 1)
         speed_batch = speed_epoch / len(train_loader)
         eta = speed_epoch * args.epochs - elapse_time
-        print("Elapsed {:.2f}s, {:.2f} s/epoch, {:.2f} s/batch, ets {:.2f}s".format(
-            elapse_time, speed_epoch, speed_batch, eta))
+        log_text = "Elapsed {:.2f}s, {:.2f} s/epoch, {:.2f} s/batch, ets {:.2f}s".format(
+            elapse_time, speed_epoch, speed_batch, eta)
+        print(log_text)
+        log_texts.append(log_text)
         misc.model_snapshot(model, os.path.join(args.logdir, 'latest.pth'))
 
         if epoch % args.test_interval == 0:
@@ -111,8 +134,15 @@ try:
 
             test_loss = test_loss / len(test_loader) # average over number of mini-batch
             acc = 100. * correct / len(test_loader.dataset)
-            print('\tTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)'.format(
-                test_loss, correct, len(test_loader.dataset), acc))
+            log_text = '\tTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)'.format(
+                test_loss, correct, len(test_loader.dataset), acc)
+            print(log_text)
+            log_texts.append(log_text)
+            
+            writer.add_scalar('test loss',
+                            test_loss, epoch)
+            writer.add_scalar('test accuracy',
+                        acc, epoch)
             if acc > best_acc:
                 new_file = os.path.join(args.logdir, 'best-{}.pth'.format(epoch))
                 misc.model_snapshot(model, new_file, old_file=old_file, verbose=True)
@@ -122,6 +152,13 @@ except Exception as e:
     import traceback
     traceback.print_exc()
 finally:
-    print("Total Elapse: {:.2f}, Best Result: {:.3f}%".format(time.time()-t_begin, best_acc))
+    log_text = "Total Elapse: {:.2f}, Best Result: {:.3f}%".format(time.time()-t_begin, best_acc)
+    print(log_text)
+    log_texts.append(log_text)
 
+writer.flush()
+writer.close()
 
+with open(EXP_FILE, 'a+') as f:
+    f.write("\n\nC = " + str(FACTOR) + " =============================== \n\n")
+    f.write("\n".join(log_texts))
